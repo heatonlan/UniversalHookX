@@ -28,9 +28,15 @@ static ID3D11DeviceContext* g_pd3dDeviceContext = NULL;
 static ID3D11RenderTargetView* g_pd3dRenderTarget = NULL;
 static IDXGISwapChain* g_pSwapChain = NULL;
 
+// Solid color shader resources
+static ID3D11VertexShader* g_pSolidColorVS = NULL;
+static ID3D11PixelShader* g_pSolidColorPS = NULL;
+static ID3D11Buffer* g_pColorBuffer = NULL;
+
 static void CleanupDeviceD3D11( );
 static void CleanupRenderTarget( );
 static void RenderImGui_DX11(IDXGISwapChain* pSwapChain);
+static void CreateSolidColorShaders( );
 
 static bool CreateDeviceD3D11(HWND hWnd) {
     // Create the D3DDevice
@@ -162,6 +168,66 @@ static HRESULT WINAPI hkCreateSwapChainForComposition(IDXGIFactory* pFactory,
     return oCreateSwapChainForComposition(pFactory, pDevice, pDesc, pRestrictToOutput, ppSwapChain);
 }
 
+// Draw call hooks for filtering
+static std::add_pointer_t<void WINAPI(ID3D11DeviceContext*, UINT, UINT, UINT)> oDrawIndexed;
+static void WINAPI hkDrawIndexed(ID3D11DeviceContext* pContext,
+                                 UINT IndexCount,
+                                 UINT StartIndexLocation,
+                                 INT BaseVertexLocation) {
+    if (Menu::bEnableDrawCallFilter) {
+        if (Menu::iCurrentDrawCall == Menu::iTargetDrawCall) {
+            // Apply material override if enabled
+            if (Menu::bEnableMaterialOverride && g_pSolidColorPS && g_pSolidColorVS) {
+                pContext->PSSetShader(g_pSolidColorPS, NULL, 0);
+                pContext->VSSetShader(g_pSolidColorVS, NULL, 0);
+                if (g_pColorBuffer) {
+                    pContext->PSSetConstantBuffers(0, 1, &g_pColorBuffer);
+                }
+            }
+            oDrawIndexed(pContext, IndexCount, StartIndexLocation, BaseVertexLocation);
+        }
+        Menu::iCurrentDrawCall++;
+    } else {
+        // Apply material override if enabled
+        if (Menu::bEnableMaterialOverride && g_pSolidColorPS && g_pSolidColorVS) {
+            pContext->PSSetShader(g_pSolidColorPS, NULL, 0);
+            pContext->VSSetShader(g_pSolidColorVS, NULL, 0);
+            if (g_pColorBuffer) {
+                pContext->PSSetConstantBuffers(0, 1, &g_pColorBuffer);
+            }
+        }
+        oDrawIndexed(pContext, IndexCount, StartIndexLocation, BaseVertexLocation);
+    }
+}
+
+static std::add_pointer_t<void WINAPI(ID3D11DeviceContext*, UINT, UINT)> oDraw;
+static void WINAPI hkDraw(ID3D11DeviceContext* pContext,
+                          UINT VertexCount,
+                          UINT StartVertexLocation) {
+    if (Menu::bEnableDrawCallFilter) {
+        if (Menu::iCurrentDrawCall == Menu::iTargetDrawCall) {
+            if (Menu::bEnableMaterialOverride && g_pSolidColorPS && g_pSolidColorVS) {
+                pContext->PSSetShader(g_pSolidColorPS, NULL, 0);
+                pContext->VSSetShader(g_pSolidColorVS, NULL, 0);
+                if (g_pColorBuffer) {
+                    pContext->PSSetConstantBuffers(0, 1, &g_pColorBuffer);
+                }
+            }
+            oDraw(pContext, VertexCount, StartVertexLocation);
+        }
+        Menu::iCurrentDrawCall++;
+    } else {
+        if (Menu::bEnableMaterialOverride && g_pSolidColorPS && g_pSolidColorVS) {
+            pContext->PSSetShader(g_pSolidColorPS, NULL, 0);
+            pContext->VSSetShader(g_pSolidColorVS, NULL, 0);
+            if (g_pColorBuffer) {
+                pContext->PSSetConstantBuffers(0, 1, &g_pColorBuffer);
+            }
+        }
+        oDraw(pContext, VertexCount, StartVertexLocation);
+    }
+}
+
 namespace DX11 {
     void Hook(HWND hwnd) {
         if (!CreateDeviceD3D11(GetConsoleWindow( ))) {
@@ -194,8 +260,13 @@ namespace DX11 {
             pDXGIAdapter->Release( );
             pDXGIDevice->Release( );
 
+            // Get device context to hook Draw calls
+            ID3D11DeviceContext* pContext = NULL;
+            g_pd3dDevice->GetImmediateContext(&pContext);
+
             void** pVTable = *reinterpret_cast<void***>(g_pSwapChain);
             void** pFactoryVTable = *reinterpret_cast<void***>(pIDXGIFactory);
+            void** pContextVTable = *reinterpret_cast<void***>(pContext);
 
             void* fnCreateSwapChain = pFactoryVTable[10];
             void* fnCreateSwapChainForHwndChain = pFactoryVTable[15];
@@ -207,6 +278,14 @@ namespace DX11 {
 
             void* fnResizeBuffers = pVTable[13];
             void* fnResizeBuffers1 = pVTable[39];
+
+            // Draw call functions (vtable indices for ID3D11DeviceContext)
+            void* fnDraw = pContextVTable[13];           // Draw
+            void* fnDrawIndexed = pContextVTable[12];    // DrawIndexed
+
+            if (pContext) {
+                pContext->Release();
+            }
 
             CleanupDeviceD3D11( );
 
@@ -221,6 +300,10 @@ namespace DX11 {
             static MH_STATUS resizeStatus = MH_CreateHook(reinterpret_cast<void**>(fnResizeBuffers), &hkResizeBuffers, reinterpret_cast<void**>(&oResizeBuffers));
             static MH_STATUS resize1Status = MH_CreateHook(reinterpret_cast<void**>(fnResizeBuffers1), &hkResizeBuffers1, reinterpret_cast<void**>(&oResizeBuffers1));
 
+            // Hook Draw calls
+            static MH_STATUS drawStatus = MH_CreateHook(reinterpret_cast<void**>(fnDraw), &hkDraw, reinterpret_cast<void**>(&oDraw));
+            static MH_STATUS drawIndexedStatus = MH_CreateHook(reinterpret_cast<void**>(fnDrawIndexed), &hkDrawIndexed, reinterpret_cast<void**>(&oDrawIndexed));
+
             MH_EnableHook(fnCreateSwapChain);
             MH_EnableHook(fnCreateSwapChainForHwndChain);
             MH_EnableHook(fnCreateSwapChainForCWindowChain);
@@ -231,6 +314,11 @@ namespace DX11 {
 
             MH_EnableHook(fnResizeBuffers);
             MH_EnableHook(fnResizeBuffers1);
+
+            MH_EnableHook(fnDraw);
+            MH_EnableHook(fnDrawIndexed);
+
+            LOG("[+] DirectX11: Draw call hooks enabled.\n");
         }
     }
 
@@ -259,6 +347,18 @@ static void CleanupRenderTarget( ) {
 static void CleanupDeviceD3D11( ) {
     CleanupRenderTarget( );
 
+    if (g_pSolidColorVS) {
+        g_pSolidColorVS->Release();
+        g_pSolidColorVS = NULL;
+    }
+    if (g_pSolidColorPS) {
+        g_pSolidColorPS->Release();
+        g_pSolidColorPS = NULL;
+    }
+    if (g_pColorBuffer) {
+        g_pColorBuffer->Release();
+        g_pColorBuffer = NULL;
+    }
     if (g_pSwapChain) {
         g_pSwapChain->Release( );
         g_pSwapChain = NULL;
@@ -273,11 +373,48 @@ static void CleanupDeviceD3D11( ) {
     }
 }
 
+static void CreateSolidColorShaders( ) {
+    if (!g_pd3dDevice)
+        return;
+
+    // Simple vertex shader that passes through position
+    const char* vsSource = 
+        "struct VS_INPUT { float4 pos : POSITION; }; "
+        "struct PS_INPUT { float4 pos : SV_POSITION; }; "
+        "PS_INPUT main(VS_INPUT input) { "
+        "    PS_INPUT output; "
+        "    output.pos = input.pos; "
+        "    return output; "
+        "}";
+
+    // Simple pixel shader that outputs solid color from constant buffer
+    const char* psSource = 
+        "cbuffer ColorBuffer : register(b0) { float4 solidColor; }; "
+        "float4 main() : SV_TARGET { return solidColor; }";
+
+    // For production, you would compile these shaders properly
+    // This is a simplified version - actual implementation would need D3DCompile
+    LOG("[+] Solid color shaders would be created here (requires D3DCompiler)\n");
+}
+
 static void RenderImGui_DX11(IDXGISwapChain* pSwapChain) {
     if (!ImGui::GetIO( ).BackendRendererUserData) {
         if (SUCCEEDED(pSwapChain->GetDevice(IID_PPV_ARGS(&g_pd3dDevice)))) {
             g_pd3dDevice->GetImmediateContext(&g_pd3dDeviceContext);
             ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
+            CreateSolidColorShaders();
+        }
+    }
+
+    // Reset draw call counter at the start of each frame
+    Menu::iCurrentDrawCall = 0;
+
+    // Update color buffer if it exists and material override is enabled
+    if (g_pColorBuffer && g_pd3dDeviceContext && Menu::bEnableMaterialOverride) {
+        D3D11_MAPPED_SUBRESOURCE mapped;
+        if (SUCCEEDED(g_pd3dDeviceContext->Map(g_pColorBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+            memcpy(mapped.pData, Menu::vSolidColor, sizeof(float) * 4);
+            g_pd3dDeviceContext->Unmap(g_pColorBuffer, 0);
         }
     }
 
